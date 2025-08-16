@@ -28,6 +28,12 @@
  */
 
 import { Z_INDEX } from '../../utils/constants.js';
+import {
+  focusInputWithIOSWorkaround,
+  isIOS,
+  logIOSEnvironment,
+  supportsProgrammaticFocus,
+} from '../../utils/ios-utils.js';
 import { createLogger } from '../../utils/logger.js';
 import type { InputManager } from './input-manager.js';
 import { ManagerEventEmitter } from './interfaces.js';
@@ -122,6 +128,11 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
   focusHiddenInput(): void {
     logger.log('Entering keyboard mode');
 
+    // Log iOS environment for debugging
+    if (isIOS()) {
+      logIOSEnvironment();
+    }
+
     // Enter keyboard mode
     this.keyboardMode = true;
     this.keyboardModeTimestamp = Date.now();
@@ -172,14 +183,15 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
       document.addEventListener('pointerdown', this.captureClickHandler, true);
     }
 
-    // Start focus retention immediately
+    // CRITICAL FOR iOS: Ensure input exists and focus it SYNCHRONOUSLY
+    // Must happen within the user gesture event handler
+    this.ensureHiddenInputVisible();
+
+    // Start focus retention after initial focus
     if (this.focusRetentionInterval) {
       clearInterval(this.focusRetentionInterval);
     }
     this.startFocusRetention();
-
-    // Ensure input is ready and focus it synchronously
-    this.ensureHiddenInputVisible();
   }
 
   ensureHiddenInputVisible(): void {
@@ -208,22 +220,35 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
       this.hiddenInput.style.display = 'block';
       this.hiddenInput.style.visibility = 'visible';
 
-      // Focus synchronously - critical for iOS Safari
-      this.hiddenInput.focus();
+      // Use iOS-specific focus workaround if on iOS
+      if (isIOS()) {
+        const focusSuccess = focusInputWithIOSWorkaround(this.hiddenInput);
+        logger.log('iOS focus attempt result:', focusSuccess);
 
-      // Set a dummy value and select it to help trigger iOS keyboard
-      // This helps iOS recognize that we want to show the keyboard
-      this.hiddenInput.value = ' ';
-      this.hiddenInput.setSelectionRange(0, 1);
-
-      // Clear the dummy value after a short delay
-      setTimeout(() => {
-        if (this.hiddenInput) {
-          this.hiddenInput.value = '';
+        // For older iOS versions that don't support programmatic focus,
+        // we may need to show a visible input temporarily
+        if (!focusSuccess && !supportsProgrammaticFocus()) {
+          logger.warn('iOS focus failed - may need user interaction');
+          // The input should still be ready for the next tap
         }
-      }, 50);
+      } else {
+        // Non-iOS: Standard focus with dummy value trick
+        this.hiddenInput.focus();
 
-      logger.log('Focused hidden input with dummy value trick');
+        // Set a dummy value and select it to help trigger keyboard
+        this.hiddenInput.value = ' ';
+        this.hiddenInput.setSelectionRange(0, 1);
+
+        // Clear the dummy value after a short delay
+        setTimeout(() => {
+          if (this.hiddenInput) {
+            this.hiddenInput.value = '';
+          }
+        }, 50);
+      }
+
+      const isFocused = document.activeElement === this.hiddenInput;
+      logger.log('Hidden input focus result:', isFocused);
     }
   }
 
@@ -233,7 +258,8 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
     this.hiddenInput.style.position = 'absolute';
 
     // Hidden input that receives keyboard focus
-    this.hiddenInput.style.opacity = '0.01'; // iOS needs non-zero opacity
+    // iOS needs slightly higher opacity for reliable focus
+    this.hiddenInput.style.opacity = isIOS() ? '0.1' : '0.01';
     this.hiddenInput.style.fontSize = '16px'; // Prevent zoom on iOS
     this.hiddenInput.style.border = 'none';
     this.hiddenInput.style.outline = 'none';
@@ -244,11 +270,18 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
     this.hiddenInput.style.pointerEvents = 'none'; // Start with pointer events disabled
     this.hiddenInput.placeholder = '';
     this.hiddenInput.style.webkitUserSelect = 'text'; // iOS specific
-    this.hiddenInput.autocapitalize = 'none'; // More explicit than 'off'
-    this.hiddenInput.autocomplete = 'off';
-    this.hiddenInput.setAttribute('autocorrect', 'off');
-    this.hiddenInput.setAttribute('spellcheck', 'false');
-    this.hiddenInput.setAttribute('data-autocorrect', 'off');
+
+    // Configurable autocorrect support for iOS (issue #423)
+    // By default, terminal inputs should have autocorrect off
+    // But users can enable it if they prefer
+    const enableAutocorrect = this.getAutocorrectPreference();
+
+    this.hiddenInput.autocapitalize = enableAutocorrect ? 'sentences' : 'none';
+    this.hiddenInput.autocomplete = enableAutocorrect ? 'on' : 'off';
+    this.hiddenInput.setAttribute('autocorrect', enableAutocorrect ? 'on' : 'off');
+    this.hiddenInput.setAttribute('spellcheck', enableAutocorrect ? 'true' : 'false');
+
+    // These should always be off for terminal input
     this.hiddenInput.setAttribute('data-gramm', 'false'); // Disable Grammarly
     this.hiddenInput.setAttribute('data-ms-editor', 'false'); // Disable Microsoft Editor
     this.hiddenInput.setAttribute('data-smartpunctuation', 'false'); // Disable smart quotes/dashes
@@ -329,6 +362,7 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
       // Prevent default for all keys to stop browser shortcuts
       if (['Enter', 'Backspace', 'Tab', 'Escape'].includes(e.key)) {
         e.preventDefault();
+        e.stopPropagation(); // Also stop propagation to prevent bubbling
       }
 
       if (e.key === 'Enter' && this.inputManager) {
@@ -339,6 +373,8 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
       } else if (e.key === 'Tab' && this.inputManager) {
         this.inputManager.sendInput(e.shiftKey ? 'shift_tab' : 'tab');
       } else if (e.key === 'Escape' && this.inputManager) {
+        // CRITICAL: Send escape to terminal, don't let it navigate back
+        // This fixes issue #492 where ESC exits the session on iOS
         this.inputManager.sendInput('escape');
       }
     });
@@ -401,18 +437,35 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
       if (this.keyboardMode) {
         logger.log('In keyboard mode - maintaining focus');
 
-        // Add a small delay to allow Done button to exit keyboard mode first
-        setTimeout(() => {
-          // Re-check keyboard mode after delay - Done button might have exited it
-          if (
-            this.keyboardMode &&
-            this.hiddenInput &&
-            document.activeElement !== this.hiddenInput
-          ) {
-            logger.log('Refocusing hidden input to maintain keyboard');
-            this.hiddenInput.focus();
-          }
-        }, 50); // 50ms delay to allow Done button processing
+        // For iOS, we need to be more careful about refocusing
+        // as it can cause keyboard flicker
+        if (isIOS() && supportsProgrammaticFocus()) {
+          // iOS 17.4+ with rate limiting - be conservative
+          setTimeout(() => {
+            if (
+              this.keyboardMode &&
+              this.hiddenInput &&
+              document.activeElement !== this.hiddenInput
+            ) {
+              logger.log('Refocusing hidden input to maintain keyboard');
+              focusInputWithIOSWorkaround(this.hiddenInput);
+            }
+          }, 100); // Slightly longer delay for iOS
+        } else if (!isIOS()) {
+          // Non-iOS: Can be more aggressive with refocus
+          setTimeout(() => {
+            if (
+              this.keyboardMode &&
+              this.hiddenInput &&
+              document.activeElement !== this.hiddenInput
+            ) {
+              logger.log('Refocusing hidden input to maintain keyboard');
+              this.hiddenInput.focus();
+            }
+          }, 50);
+        }
+        // For old iOS versions, don't try to refocus automatically
+        // as it won't work without user gesture
 
         // Don't exit keyboard mode or hide quick keys
         return;
@@ -924,6 +977,38 @@ export class DirectKeyboardManager extends ManagerEventEmitter {
 
     const timeSinceEntry = Date.now() - this.keyboardModeTimestamp;
     return timeSinceEntry < 2000; // 2 seconds
+  }
+
+  isHiddenInputFocused(): boolean {
+    return this.hiddenInput ? document.activeElement === this.hiddenInput : false;
+  }
+
+  private getAutocorrectPreference(): boolean {
+    // Check localStorage for autocorrect preference
+    // Default to false for terminal compatibility
+    try {
+      const stored = localStorage.getItem('vibetunnel_ios_autocorrect');
+      return stored === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  setAutocorrectEnabled(enabled: boolean): void {
+    // Save preference
+    try {
+      localStorage.setItem('vibetunnel_ios_autocorrect', enabled.toString());
+    } catch {
+      // Ignore storage errors
+    }
+
+    // Update existing input if it exists
+    if (this.hiddenInput) {
+      this.hiddenInput.autocapitalize = enabled ? 'sentences' : 'none';
+      this.hiddenInput.autocomplete = enabled ? 'on' : 'off';
+      this.hiddenInput.setAttribute('autocorrect', enabled ? 'on' : 'off');
+      this.hiddenInput.setAttribute('spellcheck', enabled ? 'true' : 'false');
+    }
   }
 
   showVisibleInputForKeyboard(): void {

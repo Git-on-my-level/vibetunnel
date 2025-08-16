@@ -21,6 +21,7 @@ import './session-view/session-header.js';
 import './worktree-manager.js';
 import { authClient } from '../services/auth-client.js';
 import { GitService } from '../services/git-service.js';
+import { hasHardwareKeyboard, isIOS } from '../utils/ios-utils.js';
 import { createLogger } from '../utils/logger.js';
 import { TERMINAL_IDS } from '../utils/terminal-constants.js';
 import type { TerminalThemeId } from '../utils/terminal-themes.js';
@@ -443,6 +444,21 @@ export class SessionView extends LitElement {
 
     // Use FileOperationsManager's event setup which includes dragend and global dragover
     this.fileOperationsManager.setupEventListeners(this);
+
+    // Auto-detect hardware keyboard on iOS and auto-focus if present
+    // This addresses issue #491 where hardware keyboard requires manual activation
+    if (isIOS() && hasHardwareKeyboard()) {
+      logger.log('Hardware keyboard detected on iOS - auto-focusing input');
+      // Delay slightly to ensure everything is initialized
+      setTimeout(() => {
+        const uiState = this.uiStateManager.getState();
+        if (uiState.isMobile && uiState.useDirectKeyboard) {
+          // Create the hidden input but don't show quick keys
+          // This allows hardware keyboard to work immediately
+          this.directKeyboardManager.ensureHiddenInputVisible();
+        }
+      }, 500);
+    }
   }
 
   disconnectedCallback() {
